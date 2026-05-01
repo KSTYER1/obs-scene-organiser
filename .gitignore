@@ -1,0 +1,26 @@
+# Build directories
+build/
+build_*/
+out/
+
+# OBS dependencies
+.deps/
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+
+# Compiled
+*.dll
+*.lib
+*.obj
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
