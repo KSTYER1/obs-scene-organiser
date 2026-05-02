@@ -39,7 +39,7 @@ https://github.com/KSTYER1/obs-scene-organiser
 
 ## Download URL
 
-TODO: publish or upload the 1.1.0 release package
+https://github.com/KSTYER1/obs-scene-organiser/releases/tag/v1.1.0
 
 ## Overview
 
@@ -142,7 +142,7 @@ plugin.
 - [x] README is visible on GitHub.
 - [x] GPL license is visible on GitHub.
 - [x] Source Code URL field points to the repository.
-- [ ] Release ZIP is attached to GitHub Releases or uploaded to the forum.
+- [x] Release ZIP is attached to GitHub Releases or uploaded to the forum.
 - [ ] At least one screenshot/GIF is added to the resource description.
 - [ ] Description is in English.
 - [ ] No OBS logo is used as resource icon or marketing artwork.
