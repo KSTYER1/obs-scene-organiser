@@ -1,6 +1,6 @@
 /*
  * obs-scene-organiser
- * Copyright (C) 2026 Awet
+ * Copyright (C) 2026 K_STYER1
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include <obs-module.h>
@@ -21,7 +21,7 @@ MODULE_EXPORT const char *obs_module_name(void)
 
 MODULE_EXPORT const char *obs_module_author(void)
 {
-	return "Awet";
+	return "K_STYER1";
 }
 
 extern void scene_organiser_register_dock(void);

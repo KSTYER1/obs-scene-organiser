@@ -1,6 +1,6 @@
 /*
  * obs-scene-organiser
- * Copyright (C) 2026 Awet
+ * Copyright (C) 2026 K_STYER1
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * This program is free software: you can redistribute it and/or modify it
