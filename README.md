@@ -81,7 +81,7 @@ Requires CMake 3.28 or newer, Qt 6, OBS development headers, and a supported
 compiler toolchain.
 
 ```bash
-git clone https://github.com/kstyer/obs-scene-organiser.git
+git clone https://github.com/KSTYER1/obs-scene-organiser.git
 cd obs-scene-organiser
 cmake --preset windows-x64
 cmake --build --preset windows-x64 --config RelWithDebInfo

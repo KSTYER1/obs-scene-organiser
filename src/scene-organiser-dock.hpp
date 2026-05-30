@@ -29,6 +29,7 @@ static const int RoleColor         = Qt::UserRole;
 static const int RoleObsName       = Qt::UserRole + 1;
 static const int RoleFolderScenes  = Qt::UserRole + 2;
 static const int RoleFolderSources = Qt::UserRole + 3;
+static const int RoleSearchBlink   = Qt::UserRole + 4;
 
 /* ------------------------------------------------------------------ */
 class OrgTree : public QTreeWidget {
@@ -57,6 +58,7 @@ public:
 	~SceneOrganiserDock() override;
 
 	static void frontendEvent(obs_frontend_event event, void *data);
+	void PrepareShutdown(bool fromObsExit);
 
 public slots:
 	void syncScenes();
@@ -73,6 +75,7 @@ private slots:
 	void onItemChanged(QTreeWidgetItem *item, int col);
 	void onItemDropped();
 	void scheduleRecount();
+	void advanceSearchBlink();
 
 private:
 	/* actions */
@@ -101,7 +104,13 @@ private:
 	void collectObsNames(QTreeWidgetItem *parent, QSet<QString> &out) const;
 	void removeOrphans(QTreeWidgetItem *parent, const QSet<QString> &valid);
 	void highlightItems(QTreeWidgetItem *parent, const QString &current);
-	void filterItems(QTreeWidgetItem *parent, const QString &text);
+	bool filterItems(QTreeWidgetItem *parent, const QString &text,
+			 QSet<QString> *sourceMatches);
+	bool sceneContainsSource(const QString &sceneName,
+				 const QString &text) const;
+	void startSearchBlink(const QSet<QString> &sceneNames);
+	void clearSearchBlink();
+	void setSearchBlinkVisible(QTreeWidgetItem *parent, bool visible);
 	QTreeWidgetItem *makeSceneItem(QTreeWidgetItem *parent, const QString &name);
 	QTreeWidgetItem *makeFolderItem(QTreeWidgetItem *parent, const QString &name);
 	QTreeWidgetItem *makeSeparatorItem(QTreeWidgetItem *parent);
@@ -123,9 +132,15 @@ private:
 	QLineEdit  *m_search        = nullptr;
 	QLabel     *m_counter       = nullptr;
 	QTimer     *m_recountTimer  = nullptr;
+	QTimer     *m_searchBlinkTimer = nullptr;
+	QSet<QString> m_searchBlinkSceneNames;
 	int         m_globalScenes  = 0;
 	int         m_globalSources = 0;
+	int         m_searchBlinkTicks = 0;
 
 	bool m_inhibit = false;
 	bool m_loaded  = false;
+	bool m_frontendCallbackRegistered = false;
+	bool m_sourceSignalsConnected = false;
+	bool m_shutdownPrepared = false;
 };

@@ -16,7 +16,6 @@
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QPushButton>
 #include <QLabel>
 #include <QTimer>
 #include <QMenu>
@@ -25,6 +24,7 @@
 #include <QMessageBox>
 #include <QDropEvent>
 #include <QPainter>
+#include <QPen>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -33,6 +33,7 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QFont>
+#include <QFontMetrics>
 #include <QMainWindow>
 #include <QListWidget>
 #include <QApplication>
@@ -86,27 +87,51 @@ void ColorBarDelegate::paint(QPainter *p, const QStyleOptionViewItem &opt,
 		if (!c.isValid())
 			c = QColor(110, 110, 110);
 		int y = opt.rect.top() + opt.rect.height() / 2;
-		p->fillRect(6, y - 1, opt.rect.right() - 6, 2, c);
+		p->fillRect(opt.rect.left() + 6, y - 1,
+			    qMax(0, opt.rect.width() - 12), 2, c);
 		return;
 	}
 
-	QStyledItemDelegate::paint(p, opt, idx);
+	bool searchBlink = idx.data(RoleSearchBlink).toBool();
+	QStyleOptionViewItem paintOpt(opt);
+	if (searchBlink)
+		paintOpt.backgroundBrush = QBrush(QColor(255, 214, 64, 95));
 
-	if (item && item->type() == OrgFolder) {
+	bool isFolder = item && item->type() == OrgFolder;
+	QString badge;
+	QFont badgeFont = opt.font;
+	int badgeWidth = 0;
+	if (isFolder) {
 		int s = idx.data(RoleFolderScenes).toInt();
 		int q = idx.data(RoleFolderSources).toInt();
-		QString badge = (s == 0 && q == 0)
-					? QString(obs_module_text(
-						"Organiser.Counter.Empty"))
-					: QString(obs_module_text(
-						"Organiser.Counter.Badge"))
-						  .arg(s)
-						  .arg(q);
+		badge = (s == 0 && q == 0)
+				? QString(obs_module_text(
+					"Organiser.Counter.Empty"))
+				: QString(obs_module_text(
+					"Organiser.Counter.Badge"))
+					  .arg(s)
+					  .arg(q);
+		badgeFont.setPointSizeF(qMax(6.0, badgeFont.pointSizeF() - 1.0));
+		QFontMetrics fm(badgeFont);
+		badgeWidth = fm.horizontalAdvance(badge) + 12;
+		paintOpt.rect.adjust(0, 0, -badgeWidth, 0);
+	}
 
-		QFont f = opt.font;
-		f.setPointSizeF(qMax(6.0, f.pointSizeF() - 1.0));
+	QStyledItemDelegate::paint(p, paintOpt, idx);
+
+	if (searchBlink) {
 		p->save();
-		p->setFont(f);
+		QColor line(255, 193, 7);
+		QPen pen(line);
+		pen.setWidth(2);
+		p->setPen(pen);
+		p->drawRect(opt.rect.adjusted(1, 1, -2, -2));
+		p->restore();
+	}
+
+	if (isFolder) {
+		p->save();
+		p->setFont(badgeFont);
 		p->setPen(opt.palette.color(QPalette::Disabled,
 					    QPalette::Text));
 		QRect r = opt.rect.adjusted(0, 0, -8, 0);
@@ -141,6 +166,45 @@ static QIcon makeFolderIcon(const QColor &color)
 	/* body */
 	p.drawRoundedRect(QRectF(1.5, 5.0, 13.0, 9.5), 1.5, 1.5);
 	return QIcon(pm);
+}
+
+struct SourceSearchContext {
+	QString needle;
+	bool matched = false;
+	QSet<obs_scene_t *> visitedScenes;
+};
+
+static bool sourceSearchScene(obs_scene_t *scene, SourceSearchContext *ctx);
+
+static bool sourceSearchItemCallback(obs_scene_t *, obs_sceneitem_t *item,
+				     void *data)
+{
+	auto *ctx = static_cast<SourceSearchContext *>(data);
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return true;
+
+	const char *name = obs_source_get_name(source);
+	if (name && QString::fromUtf8(name).toLower().contains(ctx->needle)) {
+		ctx->matched = true;
+		return false;
+	}
+
+	obs_scene_t *nested = obs_group_or_scene_from_source(source);
+	if (nested && sourceSearchScene(nested, ctx))
+		return false;
+
+	return true;
+}
+
+static bool sourceSearchScene(obs_scene_t *scene, SourceSearchContext *ctx)
+{
+	if (!scene || ctx->visitedScenes.contains(scene))
+		return ctx->matched;
+
+	ctx->visitedScenes.insert(scene);
+	obs_scene_enum_items(scene, sourceSearchItemCallback, ctx);
+	return ctx->matched;
 }
 
 /* ================================================================== */
@@ -183,10 +247,16 @@ SceneOrganiserDock::SceneOrganiserDock(QWidget *parent) : QWidget(parent)
 	bottomBar->setSpacing(2);
 	bottomBar->setContentsMargins(0, 0, 0, 0);
 
-	auto makeBtn = [this](const QString &text, const QString &tip) {
+	auto makeBtn = [this](QStyle::StandardPixmap iconType,
+			      const QString &fallback, const QString &tip) {
 		auto *b = new QToolButton(this);
-		b->setText(text);
+		QIcon icon = style()->standardIcon(iconType);
+		b->setText(fallback);
+		if (!icon.isNull())
+			b->setIcon(icon);
 		b->setToolTip(tip);
+		b->setAccessibleName(tip);
+		b->setToolButtonStyle(Qt::ToolButtonIconOnly);
 		b->setFixedSize(26, 24);
 		b->setAutoRaise(true);
 		QFont f = b->font();
@@ -196,12 +266,14 @@ SceneOrganiserDock::SceneOrganiserDock(QWidget *parent) : QWidget(parent)
 		return b;
 	};
 
-	auto *addBtn  = makeBtn("+",  obs_module_text("Organiser.Tip.Add"));
-	auto *delBtn  = makeBtn(QString::fromUtf8("\u2212"),
-				obs_module_text("Organiser.Tip.Delete"));
-	auto *upBtn   = makeBtn(QString::fromUtf8("\u25B2"),
-				obs_module_text("Organiser.Tip.MoveUp"));
-	auto *downBtn = makeBtn(QString::fromUtf8("\u25BC"),
+	auto *addBtn = makeBtn(QStyle::SP_FileDialogNewFolder, "+",
+			       obs_module_text("Organiser.Tip.Add"));
+	auto *delBtn = makeBtn(QStyle::SP_TrashIcon, QString::fromUtf8("\u2212"),
+			       obs_module_text("Organiser.Tip.Delete"));
+	auto *upBtn = makeBtn(QStyle::SP_ArrowUp, QString::fromUtf8("\u25B2"),
+			      obs_module_text("Organiser.Tip.MoveUp"));
+	auto *downBtn = makeBtn(QStyle::SP_ArrowDown,
+				QString::fromUtf8("\u25BC"),
 				obs_module_text("Organiser.Tip.MoveDown"));
 
 	bottomBar->addWidget(addBtn);
@@ -258,30 +330,67 @@ SceneOrganiserDock::SceneOrganiserDock(QWidget *parent) : QWidget(parent)
 	connect(m_recountTimer, &QTimer::timeout, this,
 		&SceneOrganiserDock::recomputeCounters);
 
+	m_searchBlinkTimer = new QTimer(this);
+	m_searchBlinkTimer->setInterval(140);
+	connect(m_searchBlinkTimer, &QTimer::timeout, this,
+		&SceneOrganiserDock::advanceSearchBlink);
+
 	signal_handler_t *sh = obs_get_signal_handler();
-	signal_handler_connect(sh, "source_create",
-			       &SceneOrganiserDock::onSourceSignal, this);
-	signal_handler_connect(sh, "source_destroy",
-			       &SceneOrganiserDock::onSourceSignal, this);
+	if (sh) {
+		signal_handler_connect(sh, "source_create",
+				       &SceneOrganiserDock::onSourceSignal,
+				       this);
+		signal_handler_connect(sh, "source_destroy",
+				       &SceneOrganiserDock::onSourceSignal,
+				       this);
+		m_sourceSignalsConnected = true;
+	}
 
 	obs_frontend_add_event_callback(frontendEvent, this);
+	m_frontendCallbackRegistered = true;
 }
 
 SceneOrganiserDock::~SceneOrganiserDock()
 {
-	obs_frontend_remove_event_callback(frontendEvent, this);
+	PrepareShutdown(false);
+}
 
-	signal_handler_t *sh = obs_get_signal_handler();
-	if (sh) {
+void SceneOrganiserDock::PrepareShutdown(bool fromObsExit)
+{
+	if (m_shutdownPrepared)
+		return;
+	m_shutdownPrepared = true;
+
+	if (m_recountTimer)
+		m_recountTimer->stop();
+
+	clearSearchBlink();
+
+	if (!fromObsExit)
+		return;
+
+	m_loaded = false;
+
+	if (m_frontendCallbackRegistered) {
+		obs_frontend_remove_event_callback(frontendEvent, this);
+		m_frontendCallbackRegistered = false;
+	}
+
+	if (m_sourceSignalsConnected) {
+		signal_handler_t *sh = obs_get_signal_handler();
+		if (!sh) {
+			m_sourceSignalsConnected = false;
+			return;
+		}
+
 		signal_handler_disconnect(sh, "source_create",
 					  &SceneOrganiserDock::onSourceSignal,
 					  this);
 		signal_handler_disconnect(sh, "source_destroy",
 					  &SceneOrganiserDock::onSourceSignal,
 					  this);
+		m_sourceSignalsConnected = false;
 	}
-	if (m_recountTimer)
-		m_recountTimer->stop();
 }
 
 /* ------------------------------------------------------------------ */
@@ -291,20 +400,34 @@ SceneOrganiserDock::~SceneOrganiserDock()
 void SceneOrganiserDock::frontendEvent(obs_frontend_event event, void *data)
 {
 	auto *self = static_cast<SceneOrganiserDock *>(data);
+	if (!self)
+		return;
+
 	switch (event) {
+	case OBS_FRONTEND_EVENT_EXIT:
+		self->PrepareShutdown(true);
+		break;
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
+		if (self->m_shutdownPrepared)
+			break;
 		QMetaObject::invokeMethod(self, "onFinishedLoading",
 					  Qt::QueuedConnection);
 		break;
 	case OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED:
+		if (self->m_shutdownPrepared)
+			break;
 		QMetaObject::invokeMethod(self, "syncScenes",
 					  Qt::QueuedConnection);
 		break;
 	case OBS_FRONTEND_EVENT_SCENE_CHANGED:
+		if (self->m_shutdownPrepared)
+			break;
 		QMetaObject::invokeMethod(self, "highlightCurrentScene",
 					  Qt::QueuedConnection);
 		break;
 	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+		if (self->m_shutdownPrepared)
+			break;
 		QMetaObject::invokeMethod(self, "onCollectionChanged",
 					  Qt::QueuedConnection);
 		break;
@@ -319,6 +442,9 @@ void SceneOrganiserDock::frontendEvent(obs_frontend_event event, void *data)
 
 void SceneOrganiserDock::onFinishedLoading()
 {
+	if (m_shutdownPrepared)
+		return;
+
 	load();
 	m_loaded = true;
 	syncScenes();
@@ -326,14 +452,19 @@ void SceneOrganiserDock::onFinishedLoading()
 
 void SceneOrganiserDock::onCollectionChanged()
 {
-	save();
+	if (m_shutdownPrepared)
+		return;
+
+	m_loaded = false;
 	load();
+	m_loaded = true;
+	syncScenes();
 	recomputeCounters();
 }
 
 void SceneOrganiserDock::syncScenes()
 {
-	if (!m_loaded)
+	if (m_shutdownPrepared || !m_loaded)
 		return;
 
 	m_inhibit = true;
@@ -365,6 +496,9 @@ void SceneOrganiserDock::syncScenes()
 
 void SceneOrganiserDock::highlightCurrentScene()
 {
+	if (m_shutdownPrepared)
+		return;
+
 	obs_source_t *src = obs_frontend_get_current_scene();
 	QString name = src ? QString::fromUtf8(obs_source_get_name(src)) : "";
 	if (src)
@@ -502,34 +636,139 @@ void SceneOrganiserDock::applyColor(QTreeWidgetItem *item, const QColor &color)
 		item->setIcon(0, makeFolderIcon(color));
 }
 
-void SceneOrganiserDock::filterItems(QTreeWidgetItem *parent,
-				     const QString &text)
+bool SceneOrganiserDock::filterItems(QTreeWidgetItem *parent,
+				     const QString &text,
+				     QSet<QString> *sourceMatches)
 {
+	bool anyVisible = false;
 	int n = parent ? parent->childCount() : m_tree->topLevelItemCount();
 	for (int i = 0; i < n; i++) {
 		QTreeWidgetItem *child =
 			parent ? parent->child(i) : m_tree->topLevelItem(i);
 
 		if (child->type() == OrgScene) {
-			bool match = text.isEmpty() ||
-				     child->text(0).toLower().contains(text);
-			child->setHidden(!match);
+			QString sceneName =
+				child->data(0, RoleObsName).toString();
+			bool nameMatch = text.isEmpty() ||
+					 child->text(0).toLower().contains(text);
+			bool sourceMatch =
+				!text.isEmpty() &&
+				sceneContainsSource(sceneName, text);
+			bool visible = nameMatch || sourceMatch;
+			child->setHidden(!visible);
+			child->setData(0, RoleSearchBlink, false);
+			if (sourceMatch && sourceMatches)
+				sourceMatches->insert(sceneName);
+			anyVisible = anyVisible || visible;
 		} else if (child->type() == OrgFolder) {
-			filterItems(child, text);
-			bool anyVisible = false;
-			for (int j = 0; j < child->childCount(); j++) {
-				if (!child->child(j)->isHidden()) {
-					anyVisible = true;
-					break;
-				}
-			}
+			bool childVisible =
+				filterItems(child, text, sourceMatches);
 			bool folderMatch = !text.isEmpty() &&
 					   child->text(0).toLower().contains(text);
-			child->setHidden(!anyVisible && !folderMatch);
+			bool visible = text.isEmpty() || childVisible || folderMatch;
+			child->setHidden(!visible);
 			if (!text.isEmpty())
-				child->setExpanded(anyVisible || folderMatch);
+				child->setExpanded(childVisible || folderMatch);
+			anyVisible = anyVisible || visible;
+		} else {
+			bool textFieldMatch =
+				child->type() == OrgTextField &&
+				child->text(0).toLower().contains(text);
+			bool visible = text.isEmpty() || textFieldMatch;
+			child->setHidden(!visible);
+			child->setData(0, RoleSearchBlink, false);
+			anyVisible = anyVisible || visible;
 		}
 	}
+
+	return anyVisible;
+}
+
+bool SceneOrganiserDock::sceneContainsSource(const QString &sceneName,
+					     const QString &text) const
+{
+	if (m_shutdownPrepared || text.isEmpty())
+		return false;
+
+	obs_source_t *source =
+		obs_get_source_by_name(sceneName.toUtf8().constData());
+	if (!source)
+		return false;
+
+	obs_scene_t *scene = obs_scene_from_source(source);
+	SourceSearchContext ctx{text};
+	if (scene)
+		sourceSearchScene(scene, &ctx);
+
+	obs_source_release(source);
+	return ctx.matched;
+}
+
+void SceneOrganiserDock::startSearchBlink(const QSet<QString> &sceneNames)
+{
+	clearSearchBlink();
+	if (sceneNames.isEmpty() || !m_searchBlinkTimer)
+		return;
+
+	m_searchBlinkSceneNames = sceneNames;
+	m_searchBlinkTicks = 0;
+	setSearchBlinkVisible(nullptr, true);
+	m_searchBlinkTimer->start();
+}
+
+void SceneOrganiserDock::clearSearchBlink()
+{
+	if (m_searchBlinkTimer)
+		m_searchBlinkTimer->stop();
+
+	setSearchBlinkVisible(nullptr, false);
+	m_searchBlinkSceneNames.clear();
+	m_searchBlinkTicks = 0;
+}
+
+void SceneOrganiserDock::setSearchBlinkVisible(QTreeWidgetItem *parent,
+					       bool visible)
+{
+	if (!m_tree)
+		return;
+
+	bool wasInhibit = m_inhibit;
+	m_inhibit = true;
+
+	int n = parent ? parent->childCount() : m_tree->topLevelItemCount();
+	for (int i = 0; i < n; i++) {
+		QTreeWidgetItem *child =
+			parent ? parent->child(i) : m_tree->topLevelItem(i);
+		if (child->type() == OrgScene) {
+			QString sceneName =
+				child->data(0, RoleObsName).toString();
+			bool shouldBlink =
+				visible &&
+				m_searchBlinkSceneNames.contains(sceneName);
+			if (!visible || shouldBlink)
+				child->setData(0, RoleSearchBlink, shouldBlink);
+		} else if (child->type() == OrgFolder) {
+			setSearchBlinkVisible(child, visible);
+		}
+	}
+
+	m_inhibit = wasInhibit;
+
+	if (!parent)
+		m_tree->viewport()->update();
+}
+
+void SceneOrganiserDock::advanceSearchBlink()
+{
+	if (m_shutdownPrepared || m_searchBlinkSceneNames.isEmpty()) {
+		clearSearchBlink();
+		return;
+	}
+
+	m_searchBlinkTicks++;
+	setSearchBlinkVisible(nullptr, (m_searchBlinkTicks % 2) == 0);
+	if (m_searchBlinkTicks >= 7)
+		clearSearchBlink();
 }
 
 /* ------------------------------------------------------------------ */
@@ -538,24 +777,39 @@ void SceneOrganiserDock::filterItems(QTreeWidgetItem *parent,
 
 void SceneOrganiserDock::onItemClicked(QTreeWidgetItem *item, int)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item && item->type() == OrgScene)
 		switchToScene(item);
 }
 
 void SceneOrganiserDock::onItemDoubleClicked(QTreeWidgetItem *item, int)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item && item->type() == OrgScene)
 		switchToScene(item);
 }
 
 void SceneOrganiserDock::onSearchChanged(const QString &text)
 {
-	filterItems(nullptr, text.trimmed().toLower());
+	if (m_shutdownPrepared)
+		return;
+
+	QString needle = text.trimmed().toLower();
+	QSet<QString> sourceMatches;
+	bool wasInhibit = m_inhibit;
+	m_inhibit = true;
+	filterItems(nullptr, needle, &sourceMatches);
+	startSearchBlink(sourceMatches);
+	m_inhibit = wasInhibit;
 }
 
 void SceneOrganiserDock::onItemChanged(QTreeWidgetItem *item, int col)
 {
-	if (m_inhibit || col != 0)
+	if (m_shutdownPrepared || m_inhibit || col != 0)
 		return;
 
 	if (item->type() == OrgScene) {
@@ -577,12 +831,18 @@ void SceneOrganiserDock::onItemChanged(QTreeWidgetItem *item, int col)
 
 void SceneOrganiserDock::onItemDropped()
 {
+	if (m_shutdownPrepared)
+		return;
+
 	save();
 	recomputeCounters();
 }
 
 void SceneOrganiserDock::onContextMenu(const QPoint &pos)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	QTreeWidgetItem *item = m_tree->itemAt(pos);
 	QMenu menu(this);
 
@@ -731,7 +991,7 @@ void SceneOrganiserDock::addItem()
 	menu.addAction(obs_module_text("Organiser.Action.AddTextField"), this,
 		       &SceneOrganiserDock::addTextField);
 
-	auto *btn = qobject_cast<QPushButton *>(sender());
+	auto *btn = qobject_cast<QToolButton *>(sender());
 	QPoint pos = btn ? btn->mapToGlobal(QPoint(0, btn->height())) : QCursor::pos();
 	menu.exec(pos);
 	recomputeCounters();
@@ -923,6 +1183,9 @@ void SceneOrganiserDock::clearColor(QTreeWidgetItem *item)
 
 void SceneOrganiserDock::switchToScene(QTreeWidgetItem *item)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item->type() != OrgScene)
 		return;
 	QString name = item->data(0, RoleObsName).toString();
@@ -941,6 +1204,9 @@ void SceneOrganiserDock::switchToScene(QTreeWidgetItem *item)
 
 void SceneOrganiserDock::duplicateScene(QTreeWidgetItem *item)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item->type() != OrgScene)
 		return;
 	QString name = item->data(0, RoleObsName).toString();
@@ -977,6 +1243,9 @@ void SceneOrganiserDock::duplicateScene(QTreeWidgetItem *item)
 
 void SceneOrganiserDock::removeScene(QTreeWidgetItem *item)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item->type() != OrgScene)
 		return;
 	QString name = item->data(0, RoleObsName).toString();
@@ -998,6 +1267,9 @@ void SceneOrganiserDock::removeScene(QTreeWidgetItem *item)
 
 void SceneOrganiserDock::openFilters(QTreeWidgetItem *item)
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (item->type() != OrgScene)
 		return;
 	QString name = item->data(0, RoleObsName).toString();
@@ -1051,12 +1323,18 @@ void SceneOrganiserDock::sortChildren(QTreeWidgetItem *parent,
 void SceneOrganiserDock::onSourceSignal(void *data, calldata_t *)
 {
 	auto *self = static_cast<SceneOrganiserDock *>(data);
+	if (!self || self->m_shutdownPrepared)
+		return;
+
 	QMetaObject::invokeMethod(self, "scheduleRecount",
 				  Qt::QueuedConnection);
 }
 
 void SceneOrganiserDock::scheduleRecount()
 {
+	if (m_shutdownPrepared)
+		return;
+
 	if (m_recountTimer)
 		m_recountTimer->start();
 }
@@ -1125,6 +1403,9 @@ void SceneOrganiserDock::updateHeaderLabel()
 
 void SceneOrganiserDock::recomputeCounters()
 {
+	if (m_shutdownPrepared)
+		return;
+
 	/* Global */
 	struct obs_frontend_source_list scenes = {0};
 	obs_frontend_get_scenes(&scenes);
@@ -1171,7 +1452,7 @@ QString SceneOrganiserDock::configPath() const
 
 void SceneOrganiserDock::save()
 {
-	if (m_inhibit || !m_loaded)
+	if (m_shutdownPrepared || m_inhibit || !m_loaded)
 		return;
 
 	QJsonArray items;
@@ -1190,6 +1471,10 @@ void SceneOrganiserDock::save()
 
 void SceneOrganiserDock::load()
 {
+	if (m_shutdownPrepared)
+		return;
+
+	clearSearchBlink();
 	m_inhibit = true;
 	m_tree->clear();
 
