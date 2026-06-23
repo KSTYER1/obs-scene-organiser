@@ -2,6 +2,10 @@
  * obs-scene-organiser
  * Copyright (C) 2026 K_STYER1
  * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published
+ * by the Free Software Foundation. See LICENSE for details.
  */
 #include <obs-module.h>
 #include "plugin-support.h"
@@ -25,6 +29,7 @@ MODULE_EXPORT const char *obs_module_author(void)
 }
 
 extern void scene_organiser_register_dock(void);
+extern void scene_organiser_unregister_dock(void);
 
 bool obs_module_load(void)
 {
@@ -39,5 +44,6 @@ void obs_module_post_load(void)
 
 void obs_module_unload(void)
 {
+	scene_organiser_unregister_dock();
 	obs_log(LOG_INFO, "plugin unloaded");
 }

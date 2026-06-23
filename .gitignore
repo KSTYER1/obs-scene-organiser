@@ -3,24 +3,39 @@ build/
 build_*/
 out/
 
-# OBS dependencies
+# OBS dependencies (downloaded by buildspec)
 .deps/
+
+# Build helper scripts (local-only)
+build.bat
 
 # IDE
 .vs/
 .vscode/
+.idea/
 *.user
+*.suo
 
 # CMake
 CMakeCache.txt
 CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
 
 # Compiled
-*.dll
-*.lib
 *.obj
+*.lib
+*.dll
 *.pdb
+*.exp
+*.so
+*.dylib
+*.a
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Logs
+*.log

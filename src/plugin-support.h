@@ -8,7 +8,7 @@
 #endif
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.1.0-no1"
 #endif
 
 #ifdef __cplusplus

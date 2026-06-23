@@ -33,12 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.kstyer.obs-scene-organiser"
+            "bundleId": "com.kstyer1.obs-scene-organiser"
         }
     },
     "name": "obs-scene-organiser",
     "displayName": "Scene Organiser",
     "version": "1.1.0",
+    "packageVersion": "1.1.0-no1",
     "author": "K_STYER1",
     "website": "https://github.com/KSTYER1/obs-scene-organiser",
     "email": "noreply@example.com"

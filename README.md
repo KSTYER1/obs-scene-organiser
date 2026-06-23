@@ -9,7 +9,7 @@ organisation structure.
 
 ## Features
 
-- Group scenes into nested folders.
+- Group scenes into nested folders from the folder context menu.
 - Colour bar and folder icon per folder, scene, separator, and text item.
 - Drag and drop to reorder items or move them into and out of folders.
 - Live search filters the tree while typing.
@@ -29,20 +29,6 @@ organisation structure.
 
 ## Installation
 
-Recommended installer:
-
-1. Download the `*-setup.exe` file from the latest GitHub release.
-2. Close OBS Studio.
-3. Run the installer and select your OBS Studio installation folder.
-4. Start OBS Studio again.
-
-Portable or manual installation:
-
-1. Download the release ZIP instead of the setup EXE.
-2. Extract the ZIP into your OBS Studio installation folder, or copy the
-   included `obs-plugins` and `data` folders into it.
-3. Start OBS Studio again.
-
 ### Windows
 
 Download the release archive and extract or copy its contents into your OBS
@@ -56,8 +42,7 @@ data/obs-plugins/obs-scene-organiser/locale/en-US.ini
 data/obs-plugins/obs-scene-organiser/locale/de-DE.ini
 ```
 
-The packaged release also includes `INSTALL.bat`, which can copy the plugin
-files into a selected OBS directory.
+The packaged release includes a portable ZIP and an NSIS installer.
 
 Restart OBS after installation. The dock appears under:
 
@@ -92,6 +77,11 @@ The project uses the
 structure.
 
 ## Version History
+
+### 1.1.0-no1
+
+- Removed the 1.1.0 counter header and per-folder scene/source badges.
+- Removed live source-create/source-destroy recount hooks for lower UI overhead in large scene collections.
 
 ### 1.1.0
 

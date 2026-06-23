@@ -16,7 +16,6 @@
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QLabel>
 #include <QTimer>
 #include <QMenu>
 #include <QInputDialog>
@@ -25,13 +24,18 @@
 #include <QDropEvent>
 #include <QPainter>
 #include <QPen>
+#include <QPersistentModelIndex>
+#include <QPointer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QFile>
+#include <QJsonParseError>
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
+#include <QCryptographicHash>
 #include <QFont>
 #include <QFontMetrics>
 #include <QMainWindow>
@@ -43,6 +47,12 @@
 #include <QStyle>
 #include <QToolButton>
 #include <algorithm>
+
+static const char *DOCK_ID = "obs-scene-organiser-dock";
+static SceneOrganiserDock *g_dock = nullptr;
+static bool g_dock_registered = false;
+static bool g_frontend_api_closed = false;
+static void scene_organiser_cleanup_dock(bool frontendAvailable);
 
 /* ================================================================== */
 /* OrgTree                                                             */
@@ -97,26 +107,6 @@ void ColorBarDelegate::paint(QPainter *p, const QStyleOptionViewItem &opt,
 	if (searchBlink)
 		paintOpt.backgroundBrush = QBrush(QColor(255, 214, 64, 95));
 
-	bool isFolder = item && item->type() == OrgFolder;
-	QString badge;
-	QFont badgeFont = opt.font;
-	int badgeWidth = 0;
-	if (isFolder) {
-		int s = idx.data(RoleFolderScenes).toInt();
-		int q = idx.data(RoleFolderSources).toInt();
-		badge = (s == 0 && q == 0)
-				? QString(obs_module_text(
-					"Organiser.Counter.Empty"))
-				: QString(obs_module_text(
-					"Organiser.Counter.Badge"))
-					  .arg(s)
-					  .arg(q);
-		badgeFont.setPointSizeF(qMax(6.0, badgeFont.pointSizeF() - 1.0));
-		QFontMetrics fm(badgeFont);
-		badgeWidth = fm.horizontalAdvance(badge) + 12;
-		paintOpt.rect.adjust(0, 0, -badgeWidth, 0);
-	}
-
 	QStyledItemDelegate::paint(p, paintOpt, idx);
 
 	if (searchBlink) {
@@ -126,16 +116,6 @@ void ColorBarDelegate::paint(QPainter *p, const QStyleOptionViewItem &opt,
 		pen.setWidth(2);
 		p->setPen(pen);
 		p->drawRect(opt.rect.adjusted(1, 1, -2, -2));
-		p->restore();
-	}
-
-	if (isFolder) {
-		p->save();
-		p->setFont(badgeFont);
-		p->setPen(opt.palette.color(QPalette::Disabled,
-					    QPalette::Text));
-		QRect r = opt.rect.adjusted(0, 0, -8, 0);
-		p->drawText(r, Qt::AlignVCenter | Qt::AlignRight, badge);
 		p->restore();
 	}
 
@@ -218,12 +198,6 @@ SceneOrganiserDock::SceneOrganiserDock(QWidget *parent) : QWidget(parent)
 	auto *root = new QVBoxLayout(this);
 	root->setContentsMargins(4, 4, 4, 4);
 	root->setSpacing(4);
-
-	/* ---- counter header ---- */
-	m_counter = new QLabel(this);
-	m_counter->setStyleSheet("color: #999; padding: 2px 4px;");
-	m_counter->setText(QString());
-	root->addWidget(m_counter);
 
 	/* ---- top bar (search only) ---- */
 	m_search = new QLineEdit(this);
@@ -323,36 +297,20 @@ SceneOrganiserDock::SceneOrganiserDock(QWidget *parent) : QWidget(parent)
 	connect(m_tree, &OrgTree::itemDropped, this,
 		&SceneOrganiserDock::onItemDropped);
 
-	/* ---- counter debounce timer + global source signals ---- */
-	m_recountTimer = new QTimer(this);
-	m_recountTimer->setSingleShot(true);
-	m_recountTimer->setInterval(100);
-	connect(m_recountTimer, &QTimer::timeout, this,
-		&SceneOrganiserDock::recomputeCounters);
-
 	m_searchBlinkTimer = new QTimer(this);
 	m_searchBlinkTimer->setInterval(140);
 	connect(m_searchBlinkTimer, &QTimer::timeout, this,
 		&SceneOrganiserDock::advanceSearchBlink);
 
-	signal_handler_t *sh = obs_get_signal_handler();
-	if (sh) {
-		signal_handler_connect(sh, "source_create",
-				       &SceneOrganiserDock::onSourceSignal,
-				       this);
-		signal_handler_connect(sh, "source_destroy",
-				       &SceneOrganiserDock::onSourceSignal,
-				       this);
-		m_sourceSignalsConnected = true;
-	}
-
-	obs_frontend_add_event_callback(frontendEvent, this);
-	m_frontendCallbackRegistered = true;
 }
 
 SceneOrganiserDock::~SceneOrganiserDock()
 {
-	PrepareShutdown(false);
+	PrepareShutdown(!g_frontend_api_closed);
+	if (g_dock == this) {
+		g_dock = nullptr;
+		g_dock_registered = false;
+	}
 }
 
 void SceneOrganiserDock::PrepareShutdown(bool fromObsExit)
@@ -361,35 +319,41 @@ void SceneOrganiserDock::PrepareShutdown(bool fromObsExit)
 		return;
 	m_shutdownPrepared = true;
 
-	if (m_recountTimer)
-		m_recountTimer->stop();
-
 	clearSearchBlink();
-
-	if (!fromObsExit)
-		return;
-
 	m_loaded = false;
 
-	if (m_frontendCallbackRegistered) {
+	if (fromObsExit && m_frontendCallbackRegistered) {
 		obs_frontend_remove_event_callback(frontendEvent, this);
+		m_frontendCallbackRegistered = false;
+	} else if (!fromObsExit) {
 		m_frontendCallbackRegistered = false;
 	}
 
-	if (m_sourceSignalsConnected) {
-		signal_handler_t *sh = obs_get_signal_handler();
-		if (!sh) {
-			m_sourceSignalsConnected = false;
-			return;
-		}
+	if (fromObsExit && m_sourceRenameSignalRegistered) {
+		signal_handler_t *handler = obs_get_signal_handler();
+		if (handler)
+			signal_handler_disconnect(handler, "source_rename",
+						  sourceRenameSignal, this);
+		m_sourceRenameSignalRegistered = false;
+	} else if (!fromObsExit) {
+		m_sourceRenameSignalRegistered = false;
+	}
 
-		signal_handler_disconnect(sh, "source_create",
-					  &SceneOrganiserDock::onSourceSignal,
-					  this);
-		signal_handler_disconnect(sh, "source_destroy",
-					  &SceneOrganiserDock::onSourceSignal,
-					  this);
-		m_sourceSignalsConnected = false;
+}
+
+void SceneOrganiserDock::RegisterFrontendCallback()
+{
+	if (m_frontendCallbackRegistered)
+		return;
+
+	obs_frontend_add_event_callback(frontendEvent, this);
+	m_frontendCallbackRegistered = true;
+
+	signal_handler_t *handler = obs_get_signal_handler();
+	if (handler) {
+		signal_handler_connect(handler, "source_rename",
+				       sourceRenameSignal, this);
+		m_sourceRenameSignalRegistered = true;
 	}
 }
 
@@ -405,7 +369,8 @@ void SceneOrganiserDock::frontendEvent(obs_frontend_event event, void *data)
 
 	switch (event) {
 	case OBS_FRONTEND_EVENT_EXIT:
-		self->PrepareShutdown(true);
+		scene_organiser_cleanup_dock(true);
+		g_frontend_api_closed = true;
 		break;
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		if (self->m_shutdownPrepared)
@@ -431,9 +396,37 @@ void SceneOrganiserDock::frontendEvent(obs_frontend_event event, void *data)
 		QMetaObject::invokeMethod(self, "onCollectionChanged",
 					  Qt::QueuedConnection);
 		break;
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_RENAMED:
+		if (self->m_shutdownPrepared)
+			break;
+		QMetaObject::invokeMethod(self, "onCollectionRenamed",
+					  Qt::QueuedConnection);
+		break;
 	default:
 		break;
 	}
+}
+
+void SceneOrganiserDock::sourceRenameSignal(void *data, calldata_t *cd)
+{
+	auto *self = static_cast<SceneOrganiserDock *>(data);
+	if (!self || self->m_shutdownPrepared)
+		return;
+
+	const char *prevRaw = calldata_string(cd, "prev_name");
+	const char *newRaw = calldata_string(cd, "new_name");
+	if (!prevRaw || !newRaw)
+		return;
+
+	QString prevName = QString::fromUtf8(prevRaw);
+	QString newName = QString::fromUtf8(newRaw);
+	QMetaObject::invokeMethod(
+		self,
+		[self, prevName, newName] {
+			if (!self->m_shutdownPrepared)
+				self->onSourceRenamed(prevName, newName);
+		},
+		Qt::QueuedConnection);
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,7 +438,8 @@ void SceneOrganiserDock::onFinishedLoading()
 	if (m_shutdownPrepared)
 		return;
 
-	load();
+	if (!load())
+		return;
 	m_loaded = true;
 	syncScenes();
 }
@@ -456,10 +450,30 @@ void SceneOrganiserDock::onCollectionChanged()
 		return;
 
 	m_loaded = false;
-	load();
+	if (!load())
+		return;
 	m_loaded = true;
 	syncScenes();
-	recomputeCounters();
+}
+
+void SceneOrganiserDock::onCollectionRenamed()
+{
+	if (m_shutdownPrepared)
+		return;
+
+	QString newPath = configPath();
+	if (!newPath.isEmpty() && !m_lastConfigPath.isEmpty() &&
+	    m_lastConfigPath != newPath && QFile::exists(m_lastConfigPath) &&
+	    !QFile::exists(newPath)) {
+		if (!QFile::copy(m_lastConfigPath, newPath)) {
+			obs_log(LOG_WARNING,
+				"could not migrate scene collection config %s to %s",
+				m_lastConfigPath.toUtf8().constData(),
+				newPath.toUtf8().constData());
+		}
+	}
+
+	onCollectionChanged();
 }
 
 void SceneOrganiserDock::syncScenes()
@@ -491,7 +505,6 @@ void SceneOrganiserDock::syncScenes()
 
 	highlightCurrentScene();
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::highlightCurrentScene()
@@ -813,17 +826,37 @@ void SceneOrganiserDock::onItemChanged(QTreeWidgetItem *item, int col)
 		return;
 
 	if (item->type() == OrgScene) {
-		QString newName = item->text(0);
+		QString newName = item->text(0).trimmed();
 		QString oldName = item->data(0, RoleObsName).toString();
+		if (newName.isEmpty()) {
+			m_inhibit = true;
+			item->setText(0, oldName);
+			m_inhibit = false;
+			return;
+		}
+
 		if (newName != oldName) {
 			obs_source_t *src = obs_get_source_by_name(
 				oldName.toUtf8().constData());
 			if (src) {
 				obs_source_set_name(
 					src, newName.toUtf8().constData());
+				const char *actualName = obs_source_get_name(src);
+				newName = actualName ? QString::fromUtf8(actualName)
+						     : oldName;
 				obs_source_release(src);
+			} else {
+				newName = oldName;
 			}
+
+			m_inhibit = true;
+			item->setText(0, newName);
 			item->setData(0, RoleObsName, newName);
+			m_inhibit = false;
+		} else if (item->text(0) != newName) {
+			m_inhibit = true;
+			item->setText(0, newName);
+			m_inhibit = false;
 		}
 	}
 	save();
@@ -835,7 +868,6 @@ void SceneOrganiserDock::onItemDropped()
 		return;
 
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::onContextMenu(const QPoint &pos)
@@ -844,39 +876,73 @@ void SceneOrganiserDock::onContextMenu(const QPoint &pos)
 		return;
 
 	QTreeWidgetItem *item = m_tree->itemAt(pos);
-	QMenu menu(this);
+	QPersistentModelIndex itemIndex =
+		item ? QPersistentModelIndex(m_tree->indexFromItem(item))
+		     : QPersistentModelIndex();
+	auto currentItem = [this, itemIndex]() -> QTreeWidgetItem * {
+		return itemIndex.isValid() ? m_tree->itemFromIndex(itemIndex)
+					   : nullptr;
+	};
+	QMenu menu;
 
 	if (item && item->type() == OrgSeparator) {
 		menu.addAction(
 			obs_module_text("Organiser.Action.DuplicateSeparator"),
-			this, [this, item] { duplicateSeparator(item); });
+			this, [this, currentItem] {
+				if (auto *current = currentItem())
+					duplicateSeparator(current);
+			});
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.SetColor"),
-			       this, [this, item] { pickColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       pickColor(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.ClearColor"),
-			       this, [this, item] { clearColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       clearColor(current);
+			       });
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.DeleteSeparator"),
-			       this, [this, item] { deleteSeparator(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       deleteSeparator(current);
+			       });
 
 	} else if (item && item->type() == OrgTextField) {
 		menu.addAction(obs_module_text("Organiser.Action.RenameTextField"),
-			       this, [this, item] { renameItem(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       renameItem(current);
+			       });
 		menu.addAction(
 			obs_module_text("Organiser.Action.DuplicateTextField"),
-			this, [this, item] { duplicateTextField(item); });
+			this, [this, currentItem] {
+				if (auto *current = currentItem())
+					duplicateTextField(current);
+			});
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.SetColor"),
-			       this, [this, item] { pickColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       pickColor(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.ClearColor"),
-			       this, [this, item] { clearColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       clearColor(current);
+			       });
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.DeleteTextField"),
-			       this, [this, item] { deleteTextField(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       deleteTextField(current);
+			       });
 
 	} else if (!item) {
 		menu.addAction(obs_module_text("Organiser.Action.AddFolder"),
-			       this, &SceneOrganiserDock::addFolder);
+			       this, [this] { addFolder(nullptr); });
 		menu.addAction(obs_module_text("Organiser.Action.AddSeparator"),
 			       this, &SceneOrganiserDock::addSeparator);
 		menu.addAction(obs_module_text("Organiser.Action.AddTextField"),
@@ -892,50 +958,88 @@ void SceneOrganiserDock::onContextMenu(const QPoint &pos)
 
 	} else if (item->type() == OrgFolder) {
 		menu.addAction(obs_module_text("Organiser.Action.AddFolder"),
-			       this, &SceneOrganiserDock::addFolder);
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       addFolder(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.RenameFolder"),
-			       this, [this, item] { renameItem(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       renameItem(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.DeleteFolder"),
-			       this, [this, item] { deleteFolder(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       deleteFolder(current);
+			       });
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.SetColor"),
-			       this, [this, item] { pickColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       pickColor(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.ClearColor"),
-			       this, [this, item] { clearColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       clearColor(current);
+			       });
 		menu.addSeparator();
 		QMenu *sortMenu = menu.addMenu(
 			obs_module_text("Organiser.Action.Sort"));
 		sortMenu->addAction(
 			obs_module_text("Organiser.Action.Sort.AZ"), this,
-			[this, item] {
-				sortChildren(item, Qt::AscendingOrder);
+			[this, currentItem] {
+				if (auto *current = currentItem())
+					sortChildren(current, Qt::AscendingOrder);
 			});
 		sortMenu->addAction(
 			obs_module_text("Organiser.Action.Sort.ZA"), this,
-			[this, item] {
-				sortChildren(item, Qt::DescendingOrder);
+			[this, currentItem] {
+				if (auto *current = currentItem())
+					sortChildren(current, Qt::DescendingOrder);
 			});
 
 	} else if (item->type() == OrgScene) {
 		menu.addAction(
 			obs_module_text("Organiser.Action.SwitchToScene"),
-			this, [this, item] { switchToScene(item); });
+			this, [this, currentItem] {
+				if (auto *current = currentItem())
+					switchToScene(current);
+			});
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.RenameScene"),
-			       this, [this, item] { renameItem(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       renameItem(current);
+			       });
 		menu.addAction(
 			obs_module_text("Organiser.Action.DuplicateScene"),
-			this, [this, item] { duplicateScene(item); });
+			this, [this, currentItem] {
+				if (auto *current = currentItem())
+					duplicateScene(current);
+			});
 		menu.addAction(obs_module_text("Organiser.Action.RemoveScene"),
-			       this, [this, item] { removeScene(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       removeScene(current);
+			       });
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.OpenFilters"),
-			       this, [this, item] { openFilters(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       openFilters(current);
+			       });
 		menu.addSeparator();
 		menu.addAction(obs_module_text("Organiser.Action.SetColor"),
-			       this, [this, item] { pickColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       pickColor(current);
+			       });
 		menu.addAction(obs_module_text("Organiser.Action.ClearColor"),
-			       this, [this, item] { clearColor(item); });
+			       this, [this, currentItem] {
+				       if (auto *current = currentItem())
+					       clearColor(current);
+			       });
 
 		/* Forward OBS' native scene context menu */
 		QString sceneName = item->data(0, RoleObsName).toString();
@@ -983,9 +1087,9 @@ void SceneOrganiserDock::onContextMenu(const QPoint &pos)
 
 void SceneOrganiserDock::addItem()
 {
-	QMenu menu(this);
+	QMenu menu;
 	menu.addAction(obs_module_text("Organiser.Action.AddFolder"), this,
-		       &SceneOrganiserDock::addFolder);
+		       [this] { addFolder(); });
 	menu.addAction(obs_module_text("Organiser.Action.AddSeparator"), this,
 		       &SceneOrganiserDock::addSeparator);
 	menu.addAction(obs_module_text("Organiser.Action.AddTextField"), this,
@@ -994,29 +1098,41 @@ void SceneOrganiserDock::addItem()
 	auto *btn = qobject_cast<QToolButton *>(sender());
 	QPoint pos = btn ? btn->mapToGlobal(QPoint(0, btn->height())) : QCursor::pos();
 	menu.exec(pos);
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::addFolder()
 {
+	addFolder(nullptr);
+}
+
+void SceneOrganiserDock::addFolder(QTreeWidgetItem *parent)
+{
+	QPointer<SceneOrganiserDock> guard(this);
+	QPersistentModelIndex parentIndex =
+		parent ? QPersistentModelIndex(m_tree->indexFromItem(parent))
+		       : QPersistentModelIndex();
 	bool ok;
 	QString name = QInputDialog::getText(
-		this, obs_module_text("Organiser.Dialog.AddFolder.Title"),
+		nullptr, obs_module_text("Organiser.Dialog.AddFolder.Title"),
 		obs_module_text("Organiser.Dialog.AddFolder.Text"),
 		QLineEdit::Normal, "", &ok);
+	if (!guard || m_shutdownPrepared)
+		return;
 	if (!ok || name.trimmed().isEmpty())
 		return;
+	if (parentIndex.isValid())
+		parent = m_tree->itemFromIndex(parentIndex);
+	else if (parent)
+		return;
 
-	makeFolderItem(nullptr, name.trimmed());
+	makeFolderItem(parent, name.trimmed());
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::addSeparator()
 {
 	makeSeparatorItem(nullptr);
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::deleteSeparator(QTreeWidgetItem *item)
@@ -1084,7 +1200,45 @@ void SceneOrganiserDock::deleteSelected()
 	case OrgSeparator: deleteSeparator(item); break;
 	case OrgTextField: deleteTextField(item); break;
 	}
-	recomputeCounters();
+}
+
+bool SceneOrganiserDock::replaceObsName(QTreeWidgetItem *parent,
+					const QString &prevName,
+					const QString &newName)
+{
+	int n = parent ? parent->childCount() : m_tree->topLevelItemCount();
+	for (int i = 0; i < n; i++) {
+		QTreeWidgetItem *child =
+			parent ? parent->child(i) : m_tree->topLevelItem(i);
+		if (child->type() == OrgScene &&
+		    child->data(0, RoleObsName).toString() == prevName) {
+			child->setText(0, newName);
+			child->setData(0, RoleObsName, newName);
+			return true;
+		}
+		if (child->type() == OrgFolder &&
+		    replaceObsName(child, prevName, newName))
+			return true;
+	}
+	return false;
+}
+
+void SceneOrganiserDock::onSourceRenamed(const QString &prevName,
+					 const QString &newName)
+{
+	if (m_shutdownPrepared || !m_loaded || prevName.isEmpty() ||
+	    newName.isEmpty() || prevName == newName)
+		return;
+
+	bool wasInhibit = m_inhibit;
+	m_inhibit = true;
+	bool changed = replaceObsName(nullptr, prevName, newName);
+	m_inhibit = wasInhibit;
+
+	if (changed) {
+		highlightCurrentScene();
+		save();
+	}
 }
 
 void SceneOrganiserDock::moveSelected(int direction)
@@ -1115,22 +1269,23 @@ void SceneOrganiserDock::moveSelected(int direction)
 	m_tree->setCurrentItem(item);
 	m_inhibit = false;
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::addTextField()
 {
+	QPointer<SceneOrganiserDock> guard(this);
 	bool ok;
 	QString text = QInputDialog::getText(
-		this, obs_module_text("Organiser.Dialog.AddTextField.Title"),
+		nullptr, obs_module_text("Organiser.Dialog.AddTextField.Title"),
 		obs_module_text("Organiser.Dialog.AddTextField.Text"),
 		QLineEdit::Normal, "", &ok);
+	if (!guard || m_shutdownPrepared)
+		return;
 	if (!ok || text.trimmed().isEmpty())
 		return;
 
 	makeTextFieldItem(nullptr, text.trimmed());
 	save();
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::deleteTextField(QTreeWidgetItem *item)
@@ -1151,10 +1306,15 @@ void SceneOrganiserDock::deleteFolder(QTreeWidgetItem *item)
 	if (item->type() != OrgFolder)
 		return;
 
-	int idx = m_tree->indexOfTopLevelItem(item);
+	QTreeWidgetItem *parent = item->parent();
+	int idx = parent ? parent->indexOfChild(item)
+			 : m_tree->indexOfTopLevelItem(item);
 	while (item->childCount() > 0) {
 		QTreeWidgetItem *child = item->takeChild(0);
-		m_tree->insertTopLevelItem(idx++, child);
+		if (parent)
+			parent->insertChild(idx++, child);
+		else
+			m_tree->insertTopLevelItem(idx++, child);
 	}
 	delete item;
 	save();
@@ -1162,10 +1322,17 @@ void SceneOrganiserDock::deleteFolder(QTreeWidgetItem *item)
 
 void SceneOrganiserDock::pickColor(QTreeWidgetItem *item)
 {
+	QPointer<SceneOrganiserDock> guard(this);
+	QPersistentModelIndex itemIndex = m_tree->indexFromItem(item);
 	QColor initial = item->data(0, RoleColor).value<QColor>();
 	QColor color = QColorDialog::getColor(
-		initial.isValid() ? initial : Qt::red, this,
+		initial.isValid() ? initial : Qt::red, nullptr,
 		obs_module_text("Organiser.Action.SetColor"));
+	if (!guard || m_shutdownPrepared || !itemIndex.isValid())
+		return;
+	item = m_tree->itemFromIndex(itemIndex);
+	if (!item)
+		return;
 	if (color.isValid()) {
 		applyColor(item, color);
 		save();
@@ -1238,7 +1405,6 @@ void SceneOrganiserDock::duplicateScene(QTreeWidgetItem *item)
 		obs_scene_release(dup);
 
 	obs_source_release(src);
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::removeScene(QTreeWidgetItem *item)
@@ -1250,10 +1416,13 @@ void SceneOrganiserDock::removeScene(QTreeWidgetItem *item)
 		return;
 	QString name = item->data(0, RoleObsName).toString();
 
+	QPointer<SceneOrganiserDock> guard(this);
 	if (QMessageBox::question(
-		    this, obs_module_text("Organiser.Action.RemoveScene"),
+		    nullptr, obs_module_text("Organiser.Action.RemoveScene"),
 		    QString(obs_module_text("Organiser.Dialog.Remove.Text"))
 			    .arg(name)) != QMessageBox::Yes)
+		return;
+	if (!guard || m_shutdownPrepared)
 		return;
 
 	obs_source_t *src =
@@ -1262,7 +1431,6 @@ void SceneOrganiserDock::removeScene(QTreeWidgetItem *item)
 		obs_source_remove(src);
 		obs_source_release(src);
 	}
-	recomputeCounters();
 }
 
 void SceneOrganiserDock::openFilters(QTreeWidgetItem *item)
@@ -1317,137 +1485,61 @@ void SceneOrganiserDock::sortChildren(QTreeWidgetItem *parent,
 }
 
 /* ------------------------------------------------------------------ */
-/* Counters                                                            */
-/* ------------------------------------------------------------------ */
-
-void SceneOrganiserDock::onSourceSignal(void *data, calldata_t *)
-{
-	auto *self = static_cast<SceneOrganiserDock *>(data);
-	if (!self || self->m_shutdownPrepared)
-		return;
-
-	QMetaObject::invokeMethod(self, "scheduleRecount",
-				  Qt::QueuedConnection);
-}
-
-void SceneOrganiserDock::scheduleRecount()
-{
-	if (m_shutdownPrepared)
-		return;
-
-	if (m_recountTimer)
-		m_recountTimer->start();
-}
-
-static bool count_scene_item_cb(obs_scene_t *, obs_sceneitem_t *, void *p)
-{
-	(*static_cast<int *>(p))++;
-	return true;
-}
-
-void SceneOrganiserDock::walkTree(QTreeWidgetItem *item, int *outScenes,
-				  int *outSources)
-{
-	for (int i = 0; i < item->childCount(); i++) {
-		QTreeWidgetItem *c = item->child(i);
-		switch (c->type()) {
-		case OrgFolder: {
-			int s = 0, q = 0;
-			walkTree(c, &s, &q);
-			c->setData(0, RoleFolderScenes, s);
-			c->setData(0, RoleFolderSources, q);
-			QString tip = (s == 0 && q == 0)
-					      ? QString(obs_module_text(
-							"Organiser.Counter.Empty"))
-					      : QString(obs_module_text(
-							"Organiser.Counter.Tooltip"))
-							.arg(s)
-							.arg(q);
-			c->setToolTip(0, tip);
-			*outScenes += s;
-			*outSources += q;
-			break;
-		}
-		case OrgScene: {
-			QString name = c->data(0, RoleObsName).toString();
-			obs_source_t *src = obs_get_source_by_name(
-				name.toUtf8().constData());
-			if (src) {
-				obs_scene_t *sc = obs_scene_from_source(src);
-				if (sc) {
-					int items = 0;
-					obs_scene_enum_items(sc,
-							     count_scene_item_cb,
-							     &items);
-					*outSources += items;
-				}
-				*outScenes += 1;
-				obs_source_release(src);
-			}
-			break;
-		}
-		default:
-			break; /* separators, text fields ignored */
-		}
-	}
-}
-
-void SceneOrganiserDock::updateHeaderLabel()
-{
-	if (!m_counter)
-		return;
-	m_counter->setText(QString(obs_module_text("Organiser.Counter.Header"))
-				   .arg(m_globalScenes)
-				   .arg(m_globalSources));
-}
-
-void SceneOrganiserDock::recomputeCounters()
-{
-	if (m_shutdownPrepared)
-		return;
-
-	/* Global */
-	struct obs_frontend_source_list scenes = {0};
-	obs_frontend_get_scenes(&scenes);
-	m_globalScenes  = (int)scenes.sources.num;
-	m_globalSources = 0;
-	for (size_t i = 0; i < scenes.sources.num; i++) {
-		obs_source_t *s  = scenes.sources.array[i];
-		obs_scene_t  *sc = obs_scene_from_source(s);
-		if (!sc)
-			continue;
-		int items = 0;
-		obs_scene_enum_items(sc, count_scene_item_cb, &items);
-		m_globalSources += items;
-	}
-	obs_frontend_source_list_free(&scenes);
-	updateHeaderLabel();
-
-	/* Per-folder */
-	int dummyS = 0, dummyQ = 0;
-	walkTree(m_tree->invisibleRootItem(), &dummyS, &dummyQ);
-	m_tree->viewport()->update();
-}
-
-/* ------------------------------------------------------------------ */
 /* Persistence                                                         */
 /* ------------------------------------------------------------------ */
 
-QString SceneOrganiserDock::configPath() const
+QString SceneOrganiserDock::currentSceneCollectionName() const
+{
+	char *colRaw = obs_frontend_get_current_scene_collection();
+	QString col = colRaw ? QString::fromUtf8(colRaw)
+			     : QStringLiteral("default");
+	bfree(colRaw);
+	if (col.trimmed().isEmpty())
+		return QStringLiteral("default");
+	return col;
+}
+
+QString SceneOrganiserDock::configPathForCollection(const QString &collection,
+						    bool legacy) const
 {
 	char *dirRaw = obs_module_config_path("scenes/");
+	if (!dirRaw) {
+		obs_log(LOG_WARNING, "could not resolve config directory");
+		return QString();
+	}
 	QString dir = QString::fromUtf8(dirRaw);
 	bfree(dirRaw);
 
-	QDir().mkpath(dir);
+	if (!QDir().mkpath(dir)) {
+		obs_log(LOG_WARNING, "could not create config directory: %s",
+			dir.toUtf8().constData());
+		return QString();
+	}
 
-	char *colRaw = obs_frontend_get_current_scene_collection();
-	QString col = QString::fromUtf8(colRaw)
-			      .replace(QRegularExpression("[^a-zA-Z0-9_\\- ]"),
-				       "_");
-	bfree(colRaw);
+	QString col = collection;
+	col = col.replace(QRegularExpression("[^a-zA-Z0-9_\\- ]"), "_");
+	if (col.trimmed().isEmpty())
+		col = QStringLiteral("default");
+	if (!legacy) {
+		QByteArray hash = QCryptographicHash::hash(
+						collection.toUtf8(),
+						QCryptographicHash::Sha256)
+					  .toHex()
+					  .left(12);
+		col += QStringLiteral("-") + QString::fromLatin1(hash);
+	}
 
 	return dir + col + ".json";
+}
+
+QString SceneOrganiserDock::configPath() const
+{
+	return configPathForCollection(currentSceneCollectionName(), false);
+}
+
+QString SceneOrganiserDock::legacyConfigPath() const
+{
+	return configPathForCollection(currentSceneCollectionName(), true);
 }
 
 void SceneOrganiserDock::save()
@@ -1464,30 +1556,85 @@ void SceneOrganiserDock::save()
 	root["items"] = items;
 
 	QJsonDocument doc(root);
-	QFile file(configPath());
-	if (file.open(QIODevice::WriteOnly))
-		file.write(doc.toJson(QJsonDocument::Indented));
-}
-
-void SceneOrganiserDock::load()
-{
-	if (m_shutdownPrepared)
+	QString path = configPath();
+	if (path.isEmpty())
 		return;
 
-	clearSearchBlink();
-	m_inhibit = true;
-	m_tree->clear();
+	QByteArray json = doc.toJson(QJsonDocument::Indented);
+	QSaveFile file(path);
+	if (!file.open(QIODevice::WriteOnly)) {
+		obs_log(LOG_WARNING, "could not open config for writing: %s",
+			path.toUtf8().constData());
+		return;
+	}
+	if (file.write(json) != json.size()) {
+		obs_log(LOG_WARNING, "could not write complete config: %s",
+			path.toUtf8().constData());
+		file.cancelWriting();
+		return;
+	}
+	if (!file.commit())
+		obs_log(LOG_WARNING, "could not commit config write: %s",
+			path.toUtf8().constData());
+	else
+		m_lastConfigPath = path;
+}
 
-	QFile file(configPath());
-	if (file.exists() && file.open(QIODevice::ReadOnly)) {
-		QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-		if (doc.isObject())
-			itemsFromJson(nullptr,
-				      doc.object()["items"].toArray());
+bool SceneOrganiserDock::load()
+{
+	if (m_shutdownPrepared)
+		return false;
+
+	clearSearchBlink();
+
+	QString path = configPath();
+	if (path.isEmpty())
+		return false;
+
+	QString legacyPath = legacyConfigPath();
+	if (!QFile::exists(path) && legacyPath != path && QFile::exists(legacyPath))
+		path = legacyPath;
+
+	QJsonArray items;
+	QFile file(path);
+	if (file.exists() && !file.open(QIODevice::ReadOnly)) {
+		obs_log(LOG_WARNING, "could not open config for reading %s: %s",
+			path.toUtf8().constData(),
+			file.errorString().toUtf8().constData());
+		m_inhibit = true;
+		m_tree->clear();
+		m_inhibit = false;
+		return false;
+	}
+	if (file.isOpen()) {
+		QJsonParseError err;
+		QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+		if (err.error != QJsonParseError::NoError) {
+			obs_log(LOG_WARNING, "could not parse config %s: %s",
+				path.toUtf8().constData(),
+				err.errorString().toUtf8().constData());
+			m_inhibit = true;
+			m_tree->clear();
+			m_inhibit = false;
+			return false;
+		}
+		if (!doc.isObject() || !doc.object()["items"].isArray()) {
+			obs_log(LOG_WARNING, "ignoring unsupported config shape: %s",
+				path.toUtf8().constData());
+			m_inhibit = true;
+			m_tree->clear();
+			m_inhibit = false;
+			return false;
+		}
+		items = doc.object()["items"].toArray();
 	}
 
+	m_inhibit = true;
+	m_tree->clear();
+	itemsFromJson(nullptr, items);
 	m_inhibit = false;
-	syncScenes();
+	m_lastConfigPath = path;
+	return true;
 }
 
 QJsonObject SceneOrganiserDock::itemToJson(QTreeWidgetItem *item) const
@@ -1562,10 +1709,45 @@ void SceneOrganiserDock::itemsFromJson(QTreeWidgetItem *parent,
 /* Registration                                                        */
 /* ================================================================== */
 
+static void scene_organiser_cleanup_dock(bool frontendAvailable)
+{
+	if (!g_dock)
+		return;
+
+	g_dock->PrepareShutdown(frontendAvailable);
+
+	if (frontendAvailable && g_dock_registered) {
+		obs_frontend_remove_dock(DOCK_ID);
+		g_dock_registered = false;
+	} else if (!frontendAvailable) {
+		g_dock_registered = false;
+	}
+
+	g_dock = nullptr;
+}
+
 extern "C" void scene_organiser_register_dock(void)
 {
-	auto *dock = new SceneOrganiserDock();
-	obs_frontend_add_dock_by_id("obs-scene-organiser-dock",
-				    obs_module_text("Organiser.Dock.Title"),
-				    dock);
+	if (g_dock)
+		return;
+
+	g_frontend_api_closed = false;
+	g_dock = new SceneOrganiserDock();
+	if (!obs_frontend_add_dock_by_id(DOCK_ID,
+					 obs_module_text("Organiser.Dock.Title"),
+					 g_dock)) {
+		obs_log(LOG_WARNING, "dock registration failed: %s", DOCK_ID);
+		delete g_dock;
+		g_dock = nullptr;
+		return;
+	}
+
+	g_dock_registered = true;
+	g_dock->RegisterFrontendCallback();
+	obs_log(LOG_INFO, "dock registered: %s", DOCK_ID);
+}
+
+extern "C" void scene_organiser_unregister_dock(void)
+{
+	scene_organiser_cleanup_dock(!g_frontend_api_closed);
 }

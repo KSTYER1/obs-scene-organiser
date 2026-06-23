@@ -6,7 +6,7 @@ Scene Organiser
 
 ## Version
 
-1.1.0
+1.1.0-no1
 
 ## Category
 
@@ -39,7 +39,7 @@ https://github.com/KSTYER1/obs-scene-organiser
 
 ## Download URL
 
-https://github.com/KSTYER1/obs-scene-organiser/releases/tag/v1.1.0
+https://github.com/KSTYER1/obs-scene-organiser/releases/tag/v1.1.0-no1
 
 ## Overview
 
@@ -55,7 +55,7 @@ its own folder structure and notes.
 
 ## Features
 
-- Group scenes into nested folders.
+- Group scenes into nested folders from the folder context menu.
 - Colour bar and folder icon per folder, scene, separator, and text item.
 - Drag and drop to reorder items or move them into and out of folders.
 - Live search filters the tree while typing.
@@ -66,10 +66,6 @@ its own folder structure and notes.
 - Right-click scene entries to open OBS' native scene context menu.
 - Per-scene-collection persistence as JSON in the OBS plugin config folder.
 - Bold highlight for the currently active scene.
-- Header row at the top of the dock with total scenes and sources in the
-  current scene collection.
-- Recursive scene/source count badge on every folder.
-- Live counter updates when scenes or sources are added or removed.
 
 ## Installation
 
@@ -84,8 +80,7 @@ data/obs-plugins/obs-scene-organiser/locale/en-US.ini
 data/obs-plugins/obs-scene-organiser/locale/de-DE.ini
 ```
 
-The release archive also includes `INSTALL.bat`, which can copy the plugin into
-a selected OBS directory.
+The release includes a portable ZIP and an NSIS installer.
 
 Restart OBS after installation. The dock appears under:
 
@@ -100,6 +95,11 @@ View -> Docks -> Scene Organiser
 3. Drag scenes into folders or reorder them in the tree.
 4. Use search to filter larger scene collections.
 5. Right-click a scene to access OBS' native scene context menu.
+
+## What's New in 1.1.0-no1
+
+- Removed the 1.1.0 counter header and per-folder scene/source badges.
+- Removed live source-create/source-destroy recount hooks for lower UI overhead in large scene collections.
 
 ## What's New in 1.1.0
 
